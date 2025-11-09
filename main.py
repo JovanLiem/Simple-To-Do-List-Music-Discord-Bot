@@ -3,7 +3,7 @@ import asyncio
 import asyncpg
 import subprocess
 import platform
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from discord.ext import commands, tasks
 import discord
@@ -15,6 +15,8 @@ from collections import deque
 from discord import app_commands
 from io import BytesIO
 from openpyxl import Workbook
+from openpyxl.styles import Border, Side
+import pytz
 
 # =====================================================
 # FFMPEG AUTO-INSTALLER (tetap sama)
@@ -460,21 +462,24 @@ async def dates(interaction: discord.Interaction):
 
     if final_msg:
         await interaction.response.send_message(final_msg)
-
+        
 @bot.tree.command(name="export_excel", description="Ekspor tugas kamu ke file Excel (bisa filter tanggal).")
 @app_commands.describe(
     start_date="Tanggal mulai (YYYY-MM-DD, opsional)",
     end_date="Tanggal akhir (YYYY-MM-DD, opsional)"
 )
 async def export_excel(interaction: discord.Interaction, start_date: str = "", end_date: str = ""):
+   	# Waktu WIB manual (tanpa pytz)
+    def now_wib():
+        return datetime.now(WIB)
+
     user_id = interaction.user.id
     user_name = interaction.user.name
     await interaction.response.defer(thinking=True)
 
-    # Parsing tanggal (jika diisi)
+    # Parsing tanggal
     date_filter = ""
     params = [user_id]
-
     try:
         if start_date and end_date:
             start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -492,7 +497,7 @@ async def export_excel(interaction: discord.Interaction, start_date: str = "", e
     except ValueError:
         return await interaction.followup.send("⚠️ Format tanggal salah. Gunakan format `YYYY-MM-DD`.", ephemeral=True)
 
-    # Query database
+    # Query data
     conn = await asyncpg.connect(DATABASE_URL)
     query = f"""
         SELECT task_date, task, done, created_at AT TIME ZONE 'Asia/Jakarta' AS waktu_buat
@@ -506,7 +511,7 @@ async def export_excel(interaction: discord.Interaction, start_date: str = "", e
     if not rows:
         return await interaction.followup.send("📭 Tidak ada tugas dalam rentang tanggal tersebut.")
 
-    # Buat workbook Excel
+    # Buat workbook
     wb = Workbook()
     ws = wb.active
     ws.title = "Daftar Tugas"
@@ -514,26 +519,52 @@ async def export_excel(interaction: discord.Interaction, start_date: str = "", e
     # Header
     ws.append(["Tanggal", "Deskripsi Tugas", "Status", "Dibuat Pada"])
 
-    # Isi data
+    # Tambahkan isi data
     for r in rows:
         tanggal = r["task_date"].strftime("%Y-%m-%d")
         status = "✅ Selesai" if r["done"] else "☐ Belum"
         dibuat = r["waktu_buat"].strftime("%Y-%m-%d %H:%M:%S")
         ws.append([tanggal, r["task"], status, dibuat])
 
+    # Gaya border
+    border = Border(
+        left=Side(border_style="thin", color="000000"),
+        right=Side(border_style="thin", color="000000"),
+        top=Side(border_style="thin", color="000000"),
+        bottom=Side(border_style="thin", color="000000")
+    )
+
+    # Semua sel diberi border
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=4):
+        for cell in row:
+            cell.border = border
+
+    # Gabungkan cell tanggal yang sama
+    current_date = None
+    start_row = None
+    for i in range(2, ws.max_row + 1):
+        tanggal = ws.cell(i, 1).value
+        if tanggal != current_date:
+            if start_row is not None and i - start_row > 1:
+                ws.merge_cells(start_row=start_row, start_column=1, end_row=i - 1, end_column=1)
+            current_date = tanggal
+            start_row = i
+    # Merge blok terakhir
+    if start_row is not None and ws.max_row - start_row >= 1:
+        ws.merge_cells(start_row=start_row, start_column=1, end_row=ws.max_row, end_column=1)
+
     # Auto lebar kolom
     for column_cells in ws.columns:
         max_length = max(len(str(cell.value)) if cell.value else 0 for cell in column_cells)
         ws.column_dimensions[column_cells[0].column_letter].width = max_length + 2
 
-    # Simpan ke buffer memori
+    # Simpan ke buffer
     output = BytesIO()
     wb.save(output)
     output.seek(0)
 
-    today_str = datetime.now(WIB).strftime("%Y-%m-%d")
+    today_str = now_wib().strftime("%Y-%m-%d")
     filename = f"todo_{user_name}_{today_str}.xlsx"
-
     file = discord.File(output, filename=filename)
     await interaction.followup.send("📂 Berikut file Excel tugas kamu:", file=file)
 
