@@ -105,6 +105,17 @@ async def init_db():
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
     """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            username TEXT NOT NULL,
+            guild_id BIGINT NOT NULL,
+            checkin_time TIMESTAMPTZ DEFAULT NOW(),
+            checkout_time TIMESTAMPTZ,
+            work_duration INTERVAL
+        );
+    """)
     await conn.close()
 
 @bot.event
@@ -567,6 +578,119 @@ async def export_excel(interaction: discord.Interaction, start_date: str = "", e
     filename = f"todo_{user_name}_{today_str}.xlsx"
     file = discord.File(output, filename=filename)
     await interaction.followup.send("📂 Berikut file Excel tugas kamu:", file=file)
+    
+@bot.tree.command(name="checkin", description="Catat absensi harian kamu (check-in).")
+async def checkin(interaction: discord.Interaction):
+    conn = await asyncpg.connect(DATABASE_URL)
+
+    user_id = interaction.user.id
+    username = interaction.user.name
+    guild_id = interaction.guild_id
+    wib = pytz.timezone("Asia/Jakarta")
+    now_wib = datetime.now(wib)
+
+    # Cek apakah user sudah check-in hari ini
+    record = await conn.fetchrow("""
+        SELECT id FROM attendance
+        WHERE user_id = $1 AND guild_id = $2
+        AND DATE(checkin_time AT TIME ZONE 'Asia/Jakarta') = CURRENT_DATE
+    """, user_id, guild_id)
+
+    if record:
+        await interaction.response.send_message("⚠️ Kamu sudah check-in hari ini!")
+        await conn.close()
+        return
+
+    # Simpan check-in baru
+    await conn.execute("""
+        INSERT INTO attendance (user_id, username, guild_id, checkin_time)
+        VALUES ($1, $2, $3, $4)
+    """, user_id, username, guild_id, now_wib)
+
+    await conn.close()
+
+    await interaction.response.send_message(
+        f"✅ {username}, kamu berhasil check-in pada **{now_wib.strftime('%Y-%m-%d %H:%M:%S')} WIB**!"
+    )
+
+@bot.tree.command(name="checkout", description="Catat waktu pulang kamu (checkout).")
+async def checkout(interaction: discord.Interaction):
+    conn = await asyncpg.connect(DATABASE_URL)
+
+    user_id = interaction.user.id
+    guild_id = interaction.guild_id
+    wib = pytz.timezone("Asia/Jakarta")
+    now_wib = datetime.now(wib)
+
+    # Ambil data checkin hari ini
+    record = await conn.fetchrow("""
+        SELECT id, checkin_time, checkout_time
+        FROM attendance
+        WHERE user_id = $1 AND guild_id = $2
+        AND DATE(checkin_time AT TIME ZONE 'Asia/Jakarta') = CURRENT_DATE
+        ORDER BY checkin_time DESC LIMIT 1
+    """, user_id, guild_id)
+
+    if not record:
+        await interaction.response.send_message("⚠️ Kamu belum check-in hari ini.")
+        await conn.close()
+        return
+
+    if record["checkout_time"]:
+        await interaction.response.send_message("🕓 Kamu sudah checkout hari ini.")
+        await conn.close()
+        return
+
+    checkin_time = record["checkin_time"].astimezone(wib)
+    work_duration = now_wib - checkin_time
+
+    # Update checkout_time dan durasi kerja
+    await conn.execute("""
+        UPDATE attendance
+        SET checkout_time = $1, work_duration = $2
+        WHERE id = $3
+    """, now_wib, work_duration, record["id"])
+
+    await conn.close()
+
+    hours, remainder = divmod(work_duration.total_seconds(), 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    await interaction.response.send_message(
+        f"👋 Checkout berhasil pada **{now_wib.strftime('%Y-%m-%d %H:%M:%S')} WIB**!\n"
+        f"⏰ Durasi kerja hari ini: **{int(hours)} jam {int(minutes)} menit.**"
+    )
+    
+@bot.tree.command(name="riwayat_absensi", description="Lihat riwayat absensi kamu (5 hari terakhir).")
+async def riwayat_absensi(interaction: discord.Interaction):
+    conn = await asyncpg.connect(DATABASE_URL)
+    user_id = interaction.user.id
+    wib = pytz.timezone("Asia/Jakarta")
+
+    rows = await conn.fetch("""
+        SELECT 
+            checkin_time AT TIME ZONE 'Asia/Jakarta' AS checkin,
+            checkout_time AT TIME ZONE 'Asia/Jakarta' AS checkout,
+            work_duration
+        FROM attendance
+        WHERE user_id = $1
+        ORDER BY checkin_time DESC
+        LIMIT 5
+    """, user_id)
+    await conn.close()
+
+    if not rows:
+        await interaction.response.send_message("📭 Kamu belum punya riwayat absensi.")
+        return
+
+    msg = "**🗓️ Riwayat Absensi Terakhir:**\n"
+    for r in rows:
+        checkin_str = r["checkin"].strftime("%Y-%m-%d %H:%M:%S") if r["checkin"] else "-"
+        checkout_str = r["checkout"].strftime("%Y-%m-%d %H:%M:%S") if r["checkout"] else "-"
+        durasi = str(r["work_duration"]).split(".")[0] if r["work_duration"] else "-"
+        msg += f"📅 {checkin_str} → {checkout_str} | ⏱️ {durasi}\n"
+
+    await interaction.response.send_message(msg)
 
 @bot.command()
 @commands.is_owner()
